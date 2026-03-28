@@ -1,0 +1,13 @@
+# Môi trường
+.env
+__pycache__/
+*.pyc
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Editor/OS
+.vscode/
+.DS_Store
