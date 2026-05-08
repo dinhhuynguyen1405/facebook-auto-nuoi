@@ -1,8 +1,30 @@
 import json
+import sys
+import os
 import time
 import random
+import math
+
+# Đảm bảo luôn import được từ thư mục gốc dù gọi từ đâu
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from playwright.sync_api import sync_playwright
 from adspower_farmer import AdsPowerManager
+from ai.smart_content import get_ai_comment_or_spin, get_ai_status_or_spin
+from config import settings as cfg
+from utils.logger import log
+from scheduler.schedule_plan import get_plan, get_window_hours
+from db.connector import DBConnector
+
+# Ký tự lân cận trên bàn phím QWERTY để gõ sai tự nhiên hơn
+ADJACENT_KEYS = {
+    'a': 'qwsz', 'b': 'vghn', 'c': 'xdfv', 'd': 'serfc', 'e': 'wsdr',
+    'f': 'rdgvc', 'g': 'tfhbv', 'h': 'ygjnb', 'i': 'ujko', 'j': 'uhkmn',
+    'k': 'ijlm', 'l': 'okp', 'm': 'njk', 'n': 'bhjm', 'o': 'ikp',
+    'p': 'ol', 'q': 'aw', 'r': 'edf', 's': 'awedxz', 't': 'rfgy',
+    'u': 'yhij', 'v': 'cfgb', 'w': 'qeas', 'x': 'zsdc', 'y': 'tghu',
+    'z': 'asx'
+}
 
 # ==========================================
 # CẤU HÌNH DỮ LIỆU HUMAN
@@ -60,44 +82,106 @@ def human_delay(min_sec=1, max_sec=3):
         time.sleep(random.uniform(5, 12))
 
 def human_typing(page, text):
-    """Gõ phím có tốc độ không đều và dễ gõ sai sau đó xóa đi gõ lại"""
+    """Gõ phím có tốc độ không đều và dễ gõ sai theo phím lân cận sau đó xóa đi gõ lại"""
     for char in text:
-        page.keyboard.type(char, delay=random.randint(40, 250))
-        # 3% gõ sai
-        if random.random() < 0.03:
-            human_delay(0.2, 0.4)
-            wrong_chars = random.randint(1, 3)
-            for _ in range(wrong_chars):
-                page.keyboard.type(random.choice("asdfghjklqwertyuiop"), delay=random.randint(50, 150))
-            human_delay(0.3, 0.6)
-            for _ in range(wrong_chars):
-                page.keyboard.press("Backspace")
-                time.sleep(random.uniform(0.1, 0.3))
+        page.keyboard.type(char, delay=random.randint(40, 200))
+        # 2% gõ sai tự nhiên
+        if char.lower() in ADJACENT_KEYS and random.random() < 0.02:
             human_delay(0.1, 0.3)
+            wrong_char = random.choice(ADJACENT_KEYS[char.lower()])
+            page.keyboard.type(wrong_char, delay=random.randint(50, 150))
+            human_delay(0.2, 0.4)
+            page.keyboard.press("Backspace")
+            time.sleep(random.uniform(0.1, 0.3))
+        human_delay(0.01, 0.05)
 
 def erratic_mouse_move(page, reading_mode=False):
-    """Di chuyển chuột với quỹ đạo gợn sóng / ngập ngừng"""
+    """Di chuyển chuột bằng đường cong Bezier mô phỏng tay thật"""
     try:
         viewport = page.viewport_size
         if not viewport: return
-        min_x, max_x = int(viewport['width'] * 0.2), int(viewport['width'] * 0.8)
-        min_y, max_y = int(viewport['height'] * 0.2), int(viewport['height'] * 0.8)
         
-        for _ in range(random.randint(2, 6)):
+        start_x = random.randint(0, viewport['width'])
+        start_y = random.randint(0, viewport['height'])
+        
+        for _ in range(random.randint(1, 3)):
             if reading_mode:
-                # Nếu đang đọc, chuột thường lướt theo dòng ngang hoặc để yên 1 góc gần giữa
-                x = random.randint(int(viewport['width'] * 0.3), int(viewport['width'] * 0.7))
-                y = random.randint(int(viewport['height'] * 0.4), int(viewport['height'] * 0.6))
+                end_x = random.randint(int(viewport['width'] * 0.3), int(viewport['width'] * 0.7))
+                end_y = random.randint(int(viewport['height'] * 0.4), int(viewport['height'] * 0.6))
             else:
-                x, y = random.randint(min_x, max_x), random.randint(min_y, max_y)
-            page.mouse.move(x, y, steps=random.randint(15, 45))
-            human_delay(0.1, 0.4)
+                end_x = random.randint(int(viewport['width'] * 0.2), int(viewport['width'] * 0.8))
+                end_y = random.randint(int(viewport['height'] * 0.2), int(viewport['height'] * 0.8))
+            
+            control_x = (start_x + end_x) / 2 + random.randint(-150, 150)
+            control_y = (start_y + end_y) / 2 + random.randint(-150, 150)
+            
+            steps = random.randint(15, 30)
+            for i in range(steps):
+                t = i / steps
+                x = (1-t)**2 * start_x + 2*(1-t)*t * control_x + t**2 * end_x
+                y = (1-t)**2 * start_y + 2*(1-t)*t * control_y + t**2 * end_y
+                page.mouse.move(x, y)
+                time.sleep(random.uniform(0.01, 0.03))
+            
+            start_x, start_y = end_x, end_y
+            human_delay(0.1, 0.3)
     except Exception: pass
 
-def human_scroll(page):
-    """Cuộn chuột mượt mà hơn, ngắt quãng, thỉnh thoảng cuộn ngược lên xíu (re-read)"""
+def human_swipe(page):
+    """Mô phỏng thao tác vuốt ngón tay (touch swipe) trên màn hình mobile/touch"""
     try:
         viewport = page.viewport_size
+        if not viewport:
+            return
+        cx = viewport['width'] / 2 + random.randint(-60, 60)
+        start_y = int(viewport['height'] * random.uniform(0.6, 0.8))
+        end_y = int(viewport['height'] * random.uniform(0.2, 0.4))
+
+        # Lên = scroll xuống (swipe up), ngược lại 15%
+        if random.random() < 0.85:
+            sy, ey = start_y, end_y      # Vuốt lên (xem nội dung mới)
+        else:
+            sy, ey = end_y, start_y      # Vuốt xuống (back lại)
+            print("  [Human] Vuốt ngược để nhìn lại bài vừa qua...")
+
+        steps = random.randint(18, 35)
+        page.mouse.move(cx, sy)
+        page.mouse.down()
+        for i in range(1, steps + 1):
+            t = i / steps
+            # Easing out cubic: giảm tốc cuối swipe
+            ease = 1 - (1 - t) ** 3
+            y = sy + (ey - sy) * ease
+            x = cx + random.uniform(-3, 3)
+            page.mouse.move(x, y)
+            time.sleep(random.uniform(0.008, 0.018))
+        page.mouse.up()
+        human_delay(0.5, 1.5)
+    except Exception:
+        pass
+
+
+def human_scroll(page):
+    """Cuộn chuột mượt mà hơn, có thói quen dùng phím để đọc dài, ngắt quãng"""
+    try:
+        viewport = page.viewport_size
+
+        # 15% dùng touch swipe thay wheel (thiết bị cảm ứng)
+        if random.random() < 0.15:
+            human_swipe(page)
+            return
+
+        # Thói quen dùng phím để cuộn
+        if viewport and random.random() < 0.2:
+            keys = ["PageDown", "ArrowDown", "Space"]
+            key = random.choice(keys)
+            presses = random.randint(2, 5) if key == "ArrowDown" else 1
+            for _ in range(presses):
+                page.keyboard.press(key)
+                time.sleep(random.uniform(0.1, 0.3))
+            human_delay(1, 3)
+            return
+
         if viewport:
             # Rê chuột ra giữa màn hình tí xíu hoặc hờ hờ ở góc
             center_x = viewport['width'] / 2 + random.randint(-150, 150)
@@ -152,8 +236,13 @@ def action_random_text_highlight(page):
 # LỚP TỰ ĐỘNG HÓA NÂNG CAO
 # ==========================================
 class FacebookFarmer:
-    def __init__(self, ws_endpoint):
+    def __init__(self, ws_endpoint, account_day: int = 1, user_id: str = ""):
         self.ws_endpoint = ws_endpoint
+        self.account_day = account_day
+        self.user_id = user_id
+        self._used_actions: set = set()
+        self._engagement_count: int = 0
+        self._plan = get_plan(account_day)   # DayPlan cho ngày hôm nay
 
     def get_elements_in_center(self, page, locators):
         """Lấy danh sách các phần tử đang nằm trong vùng viewport hiển thị rõ ràng"""
@@ -188,55 +277,208 @@ class FacebookFarmer:
         except Exception:
             return None
 
-    def run(self):
-        print("[Farmer] Kết nối vào trình duyệt qua Playwright (CDP)...")
+    def _resolve_actions(self, plan) -> list:
+        """Chuyển danh sách (method_name, weight) từ plan sang (callable, weight).
+        Bỏ qua method không tồn tại để không crash."""
+        resolved = []
+        for name, weight in plan["actions"]:
+            fn = getattr(self, name, None)
+            if fn is None:
+                log(f"[Farmer] ⚠️ Không tìm thấy action '{name}', bỏ qua.", "warning")
+                continue
+            resolved.append((fn, weight))
+        return resolved
+
+    def run(self) -> str:
+        """
+        Chạy một phiên farming theo schedule_plan của ngày hôm nay.
+        Trả về: 'ok' | 'checkpoint' | 'error'
+        """
+        plan = self._plan
+        log(f"[Farmer] Ngày {self.account_day} — {plan['notes']}")
+        log(f"[Farmer] Seeding: {'✅ BẬT' if plan['allow_seeding'] else '🚫 TẮT'} | Phiên: {plan['sessions']}")
+
         with sync_playwright() as p:
-            browser = p.chromium.connect_over_cdp(self.ws_endpoint)
+            try:
+                browser = p.chromium.connect_over_cdp(self.ws_endpoint)
+            except Exception as e:
+                log(f"[Farmer] ❌ Không kết nối được CDP: {e}", "error")
+                return "error"
+
             context = browser.contexts[0]
-            # Randomize user agent user-agent strings is already managed by AdsPower, we just use the default
             page = context.pages[0] if context.pages else context.new_page()
+            result = "ok"
 
             try:
                 context.grant_permissions(["notifications"])
-                print("[Farmer] Truy cập www.facebook.com...")
                 page.goto("https://www.facebook.com", timeout=60000, wait_until="domcontentloaded")
                 human_delay(5, 10)
 
-                if "login" in page.url or "checkpoint" in page.url:
-                    print("[Farmer] ⚠️ Nick bị văng hoặc checkpoint! Dừng lại.")
-                    return
+                # ── Phát hiện checkpoint / bị văng ──────────────
+                if "login" in page.url:
+                    log("[Farmer] ⚠️ Nick bị văng đăng nhập!", "warning")
+                    return "checkpoint"
+                if "checkpoint" in page.url or "disabled" in page.url:
+                    log("[Farmer] 🚨 Nick gặp CHECKPOINT / bị disable!", "error")
+                    return "checkpoint"
 
-                # Phân rã lịch trình làm việc
-                actions = [
-                    (self.surf_newsfeed, 35),
-                    (self.watch_reels, 15),
-                    (self.watch_videos, 10),
-                    (self.watch_stories, 15),
-                    (self.view_own_profile, 5),
-                    (self.search_something, 5),
-                    (self.create_text_story, 5),
-                    (self.post_status, 5),
-                    (self.visit_groups, 5)
-                ]
-                
-                # Giảm số lượng hành động lớn mỗi phiên để chạy không quá lê thê
-                session_actions = random.randint(3, 5)
-                print(f"[Farmer] Thực thi lượng công việc sâu ({session_actions} thao tác lớn)...")
-                
-                for step in range(session_actions):
-                    print(f"\n[Farmer] --- Bước {step + 1}/{session_actions} ---")
-                    action_func = random.choices([a[0] for a in actions], weights=[a[1] for a in actions])[0]
-                    action_func(page)
-                    
-                    print("[Farmer] Chuyển qua hành động tiếp theo...")
+                # ── Build action pool từ schedule_plan ──────────
+                actions = self._resolve_actions(plan)
+                if not actions:
+                    log("[Farmer] Không có action nào hợp lệ cho ngày này.", "error")
+                    return "error"
+
+                # ── Chạy các phiên trong ngày ────────────────────
+                # daily_runner sẽ gọi run() nhiều lần (1 lần/phiên),
+                # nên ở đây ta chỉ chạy 1 phiên với số bước theo plan
+                session_steps = random.randint(cfg.SESSION_ACTIONS_MIN, cfg.SESSION_ACTIONS_MAX)
+                log(f"[Farmer] Thực thi {session_steps} action trong phiên này...")
+
+                for step in range(session_steps):
+                    log(f"\n[Farmer] --- Bước {step + 1}/{session_steps} ---")
+
+                    # Anti-repeat trong phiên
+                    remaining = [(fn, w) for fn, w in actions if fn.__name__ not in self._used_actions]
+                    if not remaining:
+                        self._used_actions.clear()
+                        remaining = actions
+
+                    action_func = random.choices(
+                        [a[0] for a in remaining],
+                        weights=[a[1] for a in remaining]
+                    )[0]
+                    self._used_actions.add(action_func.__name__)
+
+                    try:
+                        action_func(page)
+                    except Exception as e:
+                        log(f"  [Farmer] Lỗi action '{action_func.__name__}': {e}", "warning")
+
+                    # Re-check checkpoint sau mỗi action nặng
+                    if "checkpoint" in page.url or "disabled" in page.url:
+                        log("[Farmer] 🚨 Checkpoint phát hiện giữa phiên!", "error")
+                        result = "checkpoint"
+                        break
+
+                    # Human breathe pause (config-driven)
+                    if random.random() < cfg.BREATHE_PAUSE_PROBABILITY:
+                        pause = random.uniform(cfg.BREATHE_PAUSE_MIN_SEC, cfg.BREATHE_PAUSE_MAX_SEC)
+                        log(f"  [Human] Đặt thiết bị xuống ~{pause:.0f}s...")
+                        time.sleep(pause)
+
                     erratic_mouse_move(page)
                     human_delay(2, 5)
 
             except Exception as e:
-                print(f"[Farmer] ❌ Gặp lỗi trong phiên: {e}")
+                log(f"[Farmer] ❌ Lỗi phiên: {e}", "error")
+                result = "error"
             finally:
-                print("[Farmer] Đóng kết nối.")
+                log("[Farmer] Đóng kết nối.")
                 browser.disconnect()
+
+        return result
+
+    def surf_newsfeed_no_engagement(self, page):
+        """Khởi động lướt trang Newsfeed nhưng không tương tác thích/comment/share"""
+        print("[Hành động] Lướt Newsfeed tĩnh lặng (Không comment/Like)...")
+        page.goto("https://www.facebook.com/", wait_until="domcontentloaded")
+        human_delay(2, 4)
+        for _ in range(random.randint(5, 10)):
+            human_scroll(page)
+            erratic_mouse_move(page, reading_mode=True)
+            action_random_text_highlight(page)
+            if random.random() < 0.2:
+                self.action_click_see_more(page)
+
+    def watch_reels_no_engagement(self, page):
+        print("[Hành động] Lướt Reels lặng im...")
+        page.goto("https://www.facebook.com/reels/", wait_until="domcontentloaded")
+        human_delay(3, 5)
+        for i in range(random.randint(4, 7)):
+            human_delay(8, 15)
+            erratic_mouse_move(page)
+            page.mouse.wheel(0, random.randint(1500, 2500))
+
+    def watch_videos_no_engagement(self, page):
+        print("[Hành động] Xem Facebook Watch giải trí (Không Like)...")
+        page.goto("https://www.facebook.com/watch", wait_until="domcontentloaded")
+        human_delay(3, 5)
+        for i in range(random.randint(3, 5)):
+            human_delay(15, 30)
+            erratic_mouse_move(page)
+            page.mouse.wheel(0, random.randint(700, 1200))
+
+    def visit_groups_no_engagement(self, page):
+        print("[Hành động] Đọc Feed nhóm tự nhiên (Không Like/Comment)...")
+        try:
+            page.goto("https://www.facebook.com/groups/feed/", wait_until="domcontentloaded")
+            human_delay(4, 8)
+            for _ in range(random.randint(6, 12)):
+                human_scroll(page)
+                if random.random() < 0.2:
+                    self.action_click_see_more(page)
+        except Exception: pass
+
+    def join_target_groups(self, page):
+        print("[Hành động] Tìm kiếm và xin tham gia Nhóm...")
+        keyword = random.choice(SEARCH_KEYWORDS)
+        try:
+            url = f"https://www.facebook.com/search/groups/?q={int(keyword.encode('utf-8').hex(), 16)}"
+            page.goto(url, wait_until="domcontentloaded") # Dummy URL logic if needed, actually we can just goto search groups directly, let's just go search url and type
+            # Or simpler:
+            page.goto("https://www.facebook.com/groups/discover/", wait_until="domcontentloaded")
+            human_delay(4, 9)
+            
+            # Cuộn 1 chút
+            for _ in range(random.randint(2, 5)):
+                human_scroll(page)
+            
+            # Bấm Tham gia
+            join_btns = page.locator('div[role="button"]:has-text("Tham gia"), div[role="button"]:has-text("Join")').all()
+            safe_btns = self.get_elements_in_center(page, join_btns)
+            if safe_btns:
+                # Gửi 1-3 yêu cầu tham gia mỗi lần
+                for _ in range(random.randint(1, 3)):
+                    if not safe_btns: break
+                    btn = random.choice(safe_btns)
+                    coords = self.get_safe_center_coords(btn)
+                    if coords:
+                        page.mouse.move(coords[0], coords[1], steps=15)
+                        human_delay(1, 2)
+                        page.mouse.click(coords[0], coords[1])
+                        print("  -> (Hành vi) Đã bấm nút XIN THAM GIA một nhóm Gợi ý!")
+                        human_delay(2, 5)
+                        # Có thể có popup trả lời câu hỏi nhóm
+                        close_btn = page.locator('div[aria-label="Đóng"], div[aria-label="Close"]').first
+                        if close_btn.is_visible(timeout=3000):
+                            close_btn.click()
+                    safe_btns.remove(btn)
+        except Exception: pass
+
+    def add_friends_suggested(self, page):
+        print("[Hành động] Lướt danh sách Gợi ý kết bạn mở rộng...")
+        try:
+            page.goto("https://www.facebook.com/friends/suggestions", wait_until="domcontentloaded")
+            human_delay(4, 7)
+            for _ in range(random.randint(2, 5)):
+                human_scroll(page)
+            
+            add_btns = page.locator('div[aria-label^="Thêm"], div[aria-label^="Add"]').all()
+            safe_btns = self.get_elements_in_center(page, add_btns)
+            if safe_btns:
+                requests = random.randint(1, 3)
+                print(f"  -> (Hành vi) Gửi {requests} yêu cầu kết bạn mở tệp...")
+                for _ in range(requests):
+                    if not safe_btns: break
+                    btn = random.choice(safe_btns)
+                    coords = self.get_safe_center_coords(btn)
+                    if coords:
+                        page.mouse.move(coords[0], coords[1], steps=20)
+                        human_delay(0.5, 1)
+                        page.mouse.click(coords[0], coords[1])
+                        human_delay(2, 6)
+                    safe_btns.remove(btn)
+        except Exception: pass
 
     def surf_newsfeed(self, page):
         """Lướt và đọc Newsfeed có bôi đen, nhấp ảnh, like dạo..."""
@@ -291,10 +533,18 @@ class FacebookFarmer:
         except Exception: pass
 
     def complex_post_engagement(self, page):
-        """BỘ NÃO TƯƠNG TÁC (Tích hợp Share/Chia sẻ mồi)"""
+        """BỘ NÃO TƯƠNG TÁC (Tích hợp Share/Ads/Save) - có giới hạn tự nhiên"""
+        # Giới hạn tối đa 8 lần tương tác nặng/phiên để tránh spam
+        self._engagement_count += 1
+        if self._engagement_count > 8:
+            prob = max(0.1, 1.0 - (self._engagement_count - 8) * 0.15)
+            if random.random() > prob:
+                print(f"  [Human] Đã tương tác {self._engagement_count} lần, mỏi tay, bỏ qua.")
+                return
+
         choice = random.choices(
-            ["view_photo", "react_emotion", "comment_and_read", "share"], 
-            weights=[30, 40, 25, 5]
+            ["view_photo", "react_emotion", "comment_and_read", "share", "click_ad", "save_post"],
+            weights=[20, 30, 20, 5, 15, 10]
         )[0]
 
         if choice == "view_photo":
@@ -305,6 +555,37 @@ class FacebookFarmer:
             self.action_read_and_engage_comments(page)
         elif choice == "share":
             self.action_share_post(page)
+        elif choice == "click_ad":
+            self.action_click_ad_or_link(page)
+        elif choice == "save_post":
+            self.action_save_post(page)
+
+    def action_save_post(self, page):
+        """Mô phỏng thói quen lưu bài viết để xem sau"""
+        try:
+            more_btns = page.locator('div[aria-haspopup="menu"][role="button"], div[aria-label="Hành động đối với bài viết"], div[aria-label="Actions for this post"]').all()
+            safe_btns = self.get_elements_in_center(page, more_btns)
+            if safe_btns:
+                btn = random.choice(safe_btns)
+                coords = self.get_safe_center_coords(btn)
+                if coords:
+                    page.mouse.move(coords[0], coords[1], steps=15)
+                    human_delay(0.5, 1)
+                    page.mouse.click(coords[0], coords[1])
+                    human_delay(1.5, 3)
+                    
+                    save_btn = page.locator('div[role="menuitem"]:has-text("Lưu"), div[role="menuitem"]:has-text("Save")').first
+                    if save_btn.is_visible(timeout=2000):
+                        save_coords = self.get_safe_center_coords(save_btn)
+                        if save_coords:
+                            page.mouse.move(save_coords[0], save_coords[1], steps=10)
+                            human_delay(0.5, 1)
+                            page.mouse.click(save_coords[0], save_coords[1])
+                            print("  -> (Hành vi) Đã bấm Lưu Post/Video để xem lại sau.")
+                            human_delay(3, 5)
+                            return
+                    page.keyboard.press("Escape")
+        except Exception: pass
 
     def action_share_post(self, page):
         try:
@@ -351,31 +632,83 @@ class FacebookFarmer:
         except Exception: pass
 
     def action_smart_reaction(self, page):
+        """Like hoặc thả reaction (tim/haha/wow/buồn/phẫn nộ) với xác suất tự nhiên"""
+        # Cấu trúc: (aria-label VN, aria-label EN, offset_x từ nút Like, weight)
+        REACTION_TARGETS = [
+            ("Thích",    "Like",    0,    45),   # Like thường - phổ biến nhất
+            ("Yêu thích","Love",   48,    25),   # Tim
+            ("Haha",     "Haha",   96,    15),   # Haha
+            ("Thật bất ngờ", "Wow", 144,  8),    # Wow
+            ("Buồn",     "Sad",   192,    5),    # Buồn
+            ("Phẫn nộ",  "Angry", 240,    2),    # Angry
+        ]
         try:
             like_bts = page.locator('div[aria-label="Thích"], div[aria-label="Like"]').all()
             safe_likes = self.get_elements_in_center(page, like_bts)
-            if safe_likes:
-                btn = random.choice(safe_likes)
-                coords = self.get_safe_center_coords(btn)
-                if coords:
-                    page.mouse.move(coords[0], coords[1], steps=15)
-                    human_delay(1, 2)
-                    
-                    if random.random() < 0.5:
-                        page.mouse.click(coords[0], coords[1])
-                        print("  -> (Hành vi) Bấm nút Like nhanh.")
-                    else:
-                        print("  -> (Hành vi) Hover để thả tim/haha.")
-                        # Hover cẩn thận
-                        page.mouse.move(coords[0], coords[1], steps=5)
-                        # trigger hover for elements
-                        page.evaluate("(el) => el.dispatchEvent(new MouseEvent('mouseover', {bubbles: true}))", btn.element_handle())
-                        human_delay(1.5, 2.5) 
-                        # Di chuột nhẹ lên trên để chọn biểu tượng (Tâm nút tim/haha thường ở trên nút Like 50-60px)
-                        page.mouse.move(coords[0] + random.randint(10, 80), coords[1] - random.randint(40, 60), steps=15)
-                        human_delay(0.5, 1)
-                        page.mouse.click() # Click ngẫu nhiên 1 biểu tượng
+            if not safe_likes:
+                return
+            btn = random.choice(safe_likes)
+            coords = self.get_safe_center_coords(btn)
+            if not coords:
+                return
+
+            page.mouse.move(coords[0], coords[1], steps=15)
+            human_delay(0.8, 1.5)
+
+            # 50% bấm Like nhanh, 50% chọn reaction icon cụ thể
+            if random.random() < 0.5:
+                page.mouse.click(coords[0], coords[1])
+                print("  -> (Hành vi) Bấm nút Like nhanh.")
+            else:
+                # Hover giữ để popup reaction hiện ra
+                page.evaluate(
+                    "(el) => el.dispatchEvent(new MouseEvent('mouseover', {bubbles: true}))",
+                    btn.element_handle()
+                )
+                page.mouse.move(coords[0], coords[1], steps=5)
+                human_delay(1.5, 2.5)  # Chờ popup hiện
+
+                # Chọn reaction theo weight tự nhiên
+                weights = [r[3] for r in REACTION_TARGETS]
+                chosen = random.choices(REACTION_TARGETS, weights=weights)[0]
+                vn_label, en_label, offset_x, _ = chosen
+
+                # Thử click theo aria-label trước (chính xác nhất)
+                reaction_el = page.locator(
+                    f'div[aria-label="{vn_label}"][role="button"], div[aria-label="{en_label}"][role="button"]'
+                ).first
+                if reaction_el.is_visible(timeout=1500):
+                    rc = self.get_safe_center_coords(reaction_el)
+                    if rc:
+                        page.mouse.move(rc[0], rc[1], steps=10)
+                        human_delay(0.3, 0.7)
+                        page.mouse.click(rc[0], rc[1])
+                        print(f"  -> (Hành vi) Đã thả reaction: {vn_label}.")
+                        return
+
+                # Fallback: di chuột theo offset cố định từ nút Like
+                target_x = coords[0] + offset_x + random.randint(-5, 5)
+                target_y = coords[1] - random.randint(45, 65)
+                page.mouse.move(target_x, target_y, steps=12)
+                human_delay(0.4, 0.8)
+                page.mouse.click(target_x, target_y)
+                print(f"  -> (Hành vi) Đã thả reaction (offset): {vn_label}.")
         except Exception: pass
+
+    def extract_post_text(self, page, coords):
+        """Cố gắng lấy text của bài viết gần con trỏ (dùng cho AI)"""
+        try:
+            # Lấy các thẻ div chứa text ở gần vị trí tương tác
+            els = page.locator('div[dir="auto"]').all()
+            for el in els:
+                if el.is_visible(timeout=500):
+                    box = el.bounding_box()
+                    if box and abs(box['y'] - coords[1]) < 800:
+                        text = el.inner_text().strip()
+                        if len(text) > 15:
+                            return text
+        except Exception: pass
+        return ""
 
     def action_read_and_engage_comments(self, page):
         """Mở bình luận ra đọc, like bình luận của người khác, reply hoặc thả comment mới"""
@@ -383,15 +716,19 @@ class FacebookFarmer:
             # 1. Tìm nút Bình luận của bài viết để mở popup/phần comment
             open_cmt_btns = page.locator('div[role="button"]:has-text("Bình luận"), div[role="button"]:has-text("Comment"), div[aria-label="Viết bình luận"], div[aria-label="Write a comment"]').all()
             safe_open_btns = self.get_elements_in_center(page, open_cmt_btns)
+            post_context_text = ""
             if safe_open_btns:
                 # Bấm vào nút đầu tiên hợp lệ tìm thấy
                 btn = safe_open_btns[0]
                 coords = self.get_safe_center_coords(btn)
                 if coords:
+                    post_context_text = self.extract_post_text(page, coords)
                     page.mouse.move(coords[0], coords[1], steps=15)
                     human_delay(0.5, 1)
                     page.mouse.click(coords[0], coords[1])
                     print("  -> (Hành vi) Mở luồng Bình luận để đọc.")
+                    if post_context_text:
+                        print(f"     [+] Lấy ngữ cảnh bài: '{post_context_text[:40]}...'")
                     human_delay(2, 5)
 
             # 2. Cuộn chuột để đọc comment
@@ -427,7 +764,7 @@ class FacebookFarmer:
                         print("  -> (Hành vi) Bấm Phản hồi (Reply) một bình luận.")
                         human_delay(1.5, 2.5)
                         
-                        reply_content = random.choice(SAFE_REPLIES)
+                        reply_content = get_ai_comment_or_spin(post_text="", context_type="reply")
                         human_typing(page, reply_content)
                         human_delay(0.5, 1)
                         page.keyboard.press("Enter")
@@ -447,11 +784,11 @@ class FacebookFarmer:
                         page.mouse.click(coords[0], coords[1])
                         human_delay(1.5, 3) 
                         
-                        content = random.choice(SAFE_COMMENTS)
+                        content = get_ai_comment_or_spin(post_text=post_context_text, context_type="post")
                         human_typing(page, content)
                         human_delay(1, 2)
                         page.keyboard.press("Enter")
-                        print(f"  -> (Hành vi) Đã thả comment mới: '{content}'")
+                        print(f"  -> (Hành vi) Đã thả comment: '{content}'")
                         human_delay(2, 4)
 
             # 6. Bấm Escape để tắt overlay comment (nếu UI Facebook mở mode Modal hiển thị comment)
@@ -499,6 +836,142 @@ class FacebookFarmer:
                     self.complex_post_engagement(page)
         except Exception: pass
 
+    def check_notifications(self, page):
+        print("[Hành động] Xem thông báo để xóa badge số đỏ...")
+        try:
+            page.goto("https://www.facebook.com/", wait_until="domcontentloaded")
+            human_delay(2, 4)
+            notif_btn = page.locator('div[aria-label="Thông báo"], div[aria-label="Notifications"]').first
+            if notif_btn.is_visible(timeout=5000):
+                coords = self.get_safe_center_coords(notif_btn)
+                if coords:
+                    page.mouse.move(coords[0], coords[1], steps=15)
+                    page.mouse.click(coords[0], coords[1])
+                    human_delay(3, 5)
+                    human_scroll(page)
+                    human_delay(2, 4)
+                    page.keyboard.press("Escape")
+        except Exception: pass
+
+    def check_messages(self, page):
+        print("[Hành động] Mở box chat đọc tin nhắn/ soạn nháp...")
+        try:
+            page.goto("https://www.facebook.com/", wait_until="domcontentloaded")
+            human_delay(2, 4)
+            msg_btn = page.locator('div[aria-label="Messenger"]').first
+            if msg_btn.is_visible(timeout=5000):
+                coords = self.get_safe_center_coords(msg_btn)
+                if coords:
+                    page.mouse.move(coords[0], coords[1], steps=15)
+                    page.mouse.click(coords[0], coords[1])
+                    human_delay(3, 6)
+                    if random.random() < 0.3:
+                        human_typing(page, "Haha")
+                        human_delay(1, 2)
+                        for _ in range(4):
+                            page.keyboard.press("Backspace")
+                            time.sleep(0.1)
+                    page.keyboard.press("Escape")
+        except Exception: pass
+
+    def action_click_ad_or_link(self, page):
+        try:
+            links = page.locator('a[target="_blank"], a[href*="l.facebook.com/l.php"]').all()
+            safe_links = self.get_elements_in_center(page, links)
+            if safe_links:
+                link = random.choice(safe_links)
+                coords = self.get_safe_center_coords(link)
+                if coords:
+                    print("  -> (Hành vi) Bấm vào link/quảng cáo để xem trang ngoài.")
+                    page.mouse.move(coords[0], coords[1], steps=15)
+                    human_delay(1, 2)
+                    with page.context.expect_page() as new_page_info:
+                        page.mouse.click(coords[0], coords[1])
+                    new_page = new_page_info.value
+                    new_page.wait_for_load_state()
+                    human_delay(5, 15)
+                    for _ in range(random.randint(2, 5)):
+                        human_scroll(new_page)
+                    new_page.close()
+                    print("  -> Đã đóng trang ngoài, quay lại Facebook.")
+                    human_delay(2, 4)
+        except Exception: pass
+
+    # ==========================
+    # CÁC NGHIỆP VỤ ĐỜI SỐNG (MARKETPLACE, BẠN BÈ)
+    # ==========================
+    def visit_marketplace(self, page):
+        """Mô phỏng thói quen hay dạo chợ đồ cũ của dân Việt"""
+        print("[Hành động] Window Shopping tại Facebook Marketplace...")
+        try:
+            page.goto("https://www.facebook.com/marketplace", wait_until="domcontentloaded")
+            human_delay(4, 9)
+            
+            # Cuộn lướt nhẹ các mặt hàng
+            for _ in range(random.randint(3, 7)):
+                human_scroll(page)
+                
+            # Random click xem một sản phẩm
+            if random.random() < 0.6:
+                items = page.locator('a[href*="/marketplace/item/"]').all()
+                safe_items = self.get_elements_in_center(page, items)
+                if safe_items:
+                    item = random.choice(safe_items)
+                    coords = self.get_safe_center_coords(item)
+                    if coords:
+                        page.mouse.move(coords[0], coords[1], steps=15)
+                        human_delay(0.5, 1.5)
+                        page.mouse.click(coords[0], coords[1])
+                        print("  -> (Hành vi) Đã bấm vào 1 bài đăng Marketplace để đọc.")
+                        human_delay(5, 10)
+                        for _ in range(random.randint(1, 3)):
+                            human_scroll(page)
+                            human_delay(2, 4)
+                        
+                        # Không mua gì cả, click thoát hình ảnh/hộp thoại về trang chợ
+                        close_btn = page.locator('div[aria-label="Đóng"], div[aria-label="Close"]').first
+                        if close_btn.is_visible(timeout=3000):
+                            close_btn.click()
+                        else:
+                            page.keyboard.press("Escape")
+                            human_delay(2, 3)
+        except Exception: pass
+
+    def manage_friend_requests(self, page):
+        """Lướt giao diện Bạn bè để đọc gợi ý hoặc các lời mời kết bạn"""
+        print("[Hành động] Kiểm tra danh sách bạn bè / Gợi ý kết bạn...")
+        try:
+            page.goto("https://www.facebook.com/friends", wait_until="domcontentloaded")
+            human_delay(4, 7)
+            
+            for _ in range(random.randint(2, 5)):
+                human_scroll(page)
+                
+            # Random xem profile của một người được gợi ý
+            if random.random() < 0.4:
+                suggested = page.locator('a[href*="profile.php"], a[href^="https://www.facebook.com/"][role="link"]').all()
+                safe_suggested = self.get_elements_in_center(page, suggested)
+                if safe_suggested:
+                    # Tránh bấm nhầm home link, chọn link từ vị trí thứ 3 trở đi thường an toàn
+                    person = random.choice(safe_suggested[2:] if len(safe_suggested) > 2 else safe_suggested)
+                    coords = self.get_safe_center_coords(person)
+                    if coords:
+                        page.mouse.move(coords[0], coords[1], steps=15)
+                        human_delay(0.5, 1.5)
+                        page.mouse.click(coords[0], coords[1])
+                        print("  -> (Hành vi) Bấm vào tường một người lạ (Gợi ý) để xem.")
+                        human_delay(6, 12)
+                        
+                        for _ in range(random.randint(2, 4)):
+                            human_scroll(page)
+                            erratic_mouse_move(page, reading_mode=True)
+                            human_delay(2, 5)
+                            
+                        # Đọc xong bấm Back (mũi tên <- trên browser) quay lại tab Friends
+                        page.go_back()
+                        human_delay(3, 5)
+        except Exception: pass
+
     def create_text_story(self, page):
         print("[Hành động] Tạo nhanh một Story chữ...")
         page.goto("https://www.facebook.com/stories/create", wait_until="domcontentloaded")
@@ -509,7 +982,7 @@ class FacebookFarmer:
                 text_story_btn.click()
                 human_delay(2, 4)
                 
-                content = random.choice(STORY_TEXTS)
+                content = get_ai_status_or_spin()
                 human_typing(page, content)
                 human_delay(2, 4)
                 
@@ -530,7 +1003,7 @@ class FacebookFarmer:
                 composer.click()
                 human_delay(2, 5) 
                 
-                content = random.choice(STATUS_TEXTS)
+                content = get_ai_status_or_spin()
                 human_typing(page, content)
                 human_delay(2, 4)
                 
@@ -628,31 +1101,200 @@ class FacebookFarmer:
                     page.keyboard.press("Escape")
         except Exception: pass
 
+    # ==========================
+    # HÀNH VI PHỤ - TĂNG ĐỘ TỰ NHIÊN
+    # ==========================
+    def browse_events(self, page):
+        """Dạo qua trang Events/Sự kiện — hành vi rất tự nhiên của người Việt"""
+        print("[Hành động] Lướt trang Sự kiện / Events...")
+        try:
+            page.goto("https://www.facebook.com/events/", wait_until="domcontentloaded")
+            human_delay(3, 6)
+            for _ in range(random.randint(3, 6)):
+                human_scroll(page)
+                erratic_mouse_move(page, reading_mode=True)
+
+            # 30% click xem chi tiết một event
+            if random.random() < 0.3:
+                event_links = page.locator('a[href*="/events/"]').all()
+                safe_links = self.get_elements_in_center(page, event_links)
+                # Bỏ qua link /events/ tổng, lấy link sự kiện cụ thể (có số ID)
+                specific = [e for e in safe_links if "/events/" in (e.get_attribute("href") or "") and len((e.get_attribute("href") or "").split("/")) > 4]
+                if specific:
+                    lnk = random.choice(specific[:5])
+                    coords = self.get_safe_center_coords(lnk)
+                    if coords:
+                        page.mouse.move(coords[0], coords[1], steps=15)
+                        human_delay(0.5, 1)
+                        page.mouse.click(coords[0], coords[1])
+                        print("  -> (Hành vi) Xem chi tiết một Sự kiện.")
+                        human_delay(5, 10)
+                        for _ in range(random.randint(2, 4)):
+                            human_scroll(page)
+                        page.go_back()
+                        human_delay(2, 4)
+        except Exception: pass
+
+    def action_copy_post_text(self, page):
+        """Copy đoạn text bài viết (Ctrl+C sau khi bôi đen) — thói quen người dùng thực"""
+        print("[Hành động] Bôi đen & copy text bài viết...")
+        try:
+            page.goto("https://www.facebook.com/", wait_until="domcontentloaded")
+            human_delay(2, 4)
+            for _ in range(random.randint(2, 4)):
+                human_scroll(page)
+
+            # Tìm đoạn text bài viết
+            text_els = page.locator('div[dir="auto"]').all()
+            candidates = [el for el in text_els if el.is_visible(timeout=300)]
+            if not candidates:
+                return
+            target = random.choice(candidates[:6])
+            box = target.bounding_box()
+            if not box:
+                return
+
+            # Bôi đen một đoạn
+            sx = box['x'] + random.uniform(5, 30)
+            sy = box['y'] + box['height'] / 2
+            ex = box['x'] + box['width'] * random.uniform(0.4, 0.9)
+            ey = sy + random.uniform(-5, 10)
+
+            page.mouse.move(sx, sy, steps=15)
+            page.mouse.down()
+            human_delay(0.15, 0.35)
+            page.mouse.move(ex, ey, steps=20)
+            human_delay(0.2, 0.6)
+            page.mouse.up()
+            print("  -> (Hành vi) Đã bôi đen text.")
+            human_delay(0.5, 1.5)
+
+            # Ctrl+C
+            page.keyboard.press("Meta+c" if sys.platform == "darwin" else "Control+c")
+            print("  -> (Hành vi) Ctrl+C copy text.")
+            human_delay(2, 4)
+
+            # Click bỏ bôi đen
+            page.mouse.click(sx - 50, sy - 30)
+        except Exception: pass
+
+    def action_open_link_in_new_tab(self, page):
+        """Ctrl+click mở link trong tab mới rồi xem 1 lúc, đóng lại — hành vi browser thực"""
+        print("[Hành động] Mở link ngoài trong tab mới...")
+        try:
+            page.goto("https://www.facebook.com/", wait_until="domcontentloaded")
+            human_delay(2, 4)
+            for _ in range(random.randint(2, 4)):
+                human_scroll(page)
+
+            external_links = page.locator('a[href*="l.facebook.com/l.php"], a[target="_blank"]').all()
+            safe_links = self.get_elements_in_center(page, external_links)
+            if not safe_links:
+                return
+
+            lnk = random.choice(safe_links)
+            coords = self.get_safe_center_coords(lnk)
+            if not coords:
+                return
+
+            page.mouse.move(coords[0], coords[1], steps=18)
+            human_delay(0.5, 1)
+
+            # Ctrl+click → tab mới
+            try:
+                with page.context.expect_page(timeout=8000) as new_tab_info:
+                    page.mouse.click(
+                        coords[0], coords[1],
+                        modifiers=["Meta"] if sys.platform == "darwin" else ["Control"]
+                    )
+                new_tab = new_tab_info.value
+                new_tab.wait_for_load_state("domcontentloaded", timeout=15000)
+                print("  -> (Hành vi) Mở tab mới, đang đọc nội dung ngoài...")
+                human_delay(6, 15)
+                for _ in range(random.randint(2, 5)):
+                    human_scroll(new_tab)
+                new_tab.close()
+                print("  -> Đóng tab ngoài, quay lại Facebook.")
+                human_delay(2, 4)
+            except Exception:
+                pass
+        except Exception: pass
+
+
 def main():
-    manager = AdsPowerManager()
+    # ── Validate config bắt buộc trước khi làm gì ──
     try:
-        with open("accounts.json", "r") as f:
+        cfg.validate()
+    except EnvironmentError as e:
+        log(str(e))
+        sys.exit(1)
+
+    # ── Đọc danh sách accounts ──────────────────────
+    try:
+        with open(cfg.ACCOUNTS_FILE, "r", encoding="utf-8") as f:
             accounts = json.load(f)
     except FileNotFoundError:
-        print("[Lỗi] Không tìm thấy file accounts.json!")
-        return
+        log(f"[Lỗi] Không tìm thấy file accounts: {cfg.ACCOUNTS_FILE}")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        log(f"[Lỗi] accounts.json không hợp lệ: {e}")
+        sys.exit(1)
 
-    for acc in accounts:
-        if acc.get("status") != "active": continue
+    active = [a for a in accounts if a.get("status") == "active"]
+    if not active:
+        log("[Lỗi] Không có account nào status=active trong accounts.json")
+        sys.exit(1)
+
+    log(f"Tìm thấy {len(active)} account active. Bắt đầu farming...")
+
+    db = DBConnector(cfg.DB_PATH)
+    manager = AdsPowerManager(
+        api_url=cfg.ADSPOWER_API_URL,
+        api_key=cfg.ADSPOWER_API_KEY,
+    )
+
+    for acc in active:
         user_id = acc["user_id"]
-        print(f"\n======================================")
-        print(f"BẮT ĐẦU HOẠT ĐỘNG: {acc['name']} (ID: {user_id})")
-        print(f"======================================")
+        name    = acc.get("name", user_id)
+
+        # ── Đồng bộ state từ DB (ưu tiên DB, fallback về accounts.json) ──
+        db.upsert_account(user_id, name=name, day_number=acc.get("day", 1))
+        state = db.get_account(user_id)
+        day   = state.get("day_number", acc.get("day", 1))
+
+        log(f"\n{'='*50}")
+        log(f"BẮT ĐẦU: {name} (ID: {user_id}) | Ngày nuôi: {day}")
+        log(f"{'='*50}")
 
         ws_endpoint = manager.start_profile(user_id)
-        if ws_endpoint:
+        if not ws_endpoint:
+            log(f"[Bỏ qua] Không mở được browser cho {name}.")
+            db.log_action(user_id, "start_profile", "failed", day)
             human_delay(5, 10)
-            farmer = FacebookFarmer(ws_endpoint)
-            farmer.run()
-            manager.stop_profile(user_id)
-            
-        print(f"[Hoàn thành] ⏳ Nghỉ ngơi chuyển Profile.")
+            continue
+
+        human_delay(5, 10)
+        farmer = FacebookFarmer(ws_endpoint, account_day=day, user_id=user_id)
+        result = farmer.run()
+        manager.stop_profile(user_id)
+
+        # ── Xử lý kết quả ───────────────────────────────
+        db.log_action(user_id, "session", result, day)
+        if result == "checkpoint":
+            db.mark_checkpoint(user_id)
+            log(f"[{name}] 🚨 Checkpoint! Đã đánh dấu — cần xử lý thủ công.", "error")
+        elif result == "ok":
+            db.increment_day(user_id)
+            new_day = day + 1
+            log(f"[{name}] ✅ Hoàn thành ngày {day} → chuyển sang ngày {new_day}.")
+        else:
+            log(f"[{name}] ⚠️ Phiên kết thúc với lỗi, giữ nguyên ngày {day}.", "warning")
+
+        log(f"Nghỉ ngơi trước khi chuyển Profile tiếp theo...")
         human_delay(15, 30)
+
+    log("Đã hoàn thành tất cả accounts.")
+
 
 if __name__ == "__main__":
     main()

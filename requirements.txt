@@ -1,3 +1,18 @@
-requests==2.31.0
+# Browser automation
 playwright==1.42.0
+
+# HTTP requests (AdsPower API)
+requests==2.31.0
+
+# Environment variables
 python-dotenv==1.0.1
+
+# Google Gemini AI (sinh comment/status tự nhiên)
+google-generativeai>=0.5.0
+
+# Scheduler (chạy farm theo lịch tự động)
+APScheduler>=3.10.0
+
+# Web API (cho Farmer UI)
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
